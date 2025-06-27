@@ -1,0 +1,1642 @@
+---
+title: "project1(Yitian Zhu)"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+# Load all required libraries
+library(tidyverse)       
+library(corrplot)
+library(randomForest)
+library(lme4)
+library(brms)
+library(inlabru)
+library(INLA)
+library(Metrics)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(viridis)
+library(ggrepel)
+library(scales)
+library(xtable)
+library(bayesplot)
+library(maps)
+library(stargazer)
+library(car)
+library(httr)
+library(jsonlite)
+
+```
+
+```{r}
+
+# --- Data import & initial cleaning ---
+gym_data <- read.csv("Uoe_data_all.csv") %>%
+  select(-GymUsableSqFt, -GymMaxOccupancy) %>%    # drop leakage variables
+  mutate(
+    GymSiteType = as.factor(GymSiteType),
+    GymParking  = as.factor(GymParking)
+  )
+
+gym_data$log_Total.Members <-log(gym_data$Total.Members) 
+
+# --- Time indexing ---
+gym_data <- gym_data %>%
+  mutate(
+    StartMonthDate = as.Date(paste0(StartMonth, "-01")),
+    Date = StartMonthDate,
+    Month_Index    = 1 +
+      (year(StartMonthDate) - min(year(StartMonthDate))) * 12 +
+      (month(StartMonthDate) - min(month(StartMonthDate)))
+  )
+
+# --- Feature scaling & transformation ---
+num_vars <- gym_data %>%
+  select_if(is.numeric) %>%
+  select(-Total.Members, -Month_Index, -Latitude, -Longitude) %>%
+  names()
+
+gym_data_scaled <- gym_data %>%
+  mutate(across(all_of(num_vars), scale)) %>%
+  mutate(Total.Members = log(Total.Members))
+
+# Now gym_data_scaled contains standardized predictors and log-transformed response
+```
+
+```{r}
+# --- Exploratory boxplots of membership counts ---
+ggplot(gym_data, aes(y = Total.Members)) +
+  geom_boxplot(fill = "steelblue", color = "black", width = 0.1) +
+  labs(title = "Boxplot of Total Members", y = "Total Members") +
+  theme_minimal() +
+  theme(
+    panel.grid     = element_blank(),
+    axis.title.x   = element_blank(),
+    axis.text.x    = element_blank(),
+    axis.ticks.x   = element_blank(),
+    aspect.ratio   = 2
+  )
+
+ggplot(gym_data, aes(y = log_Total.Members)) +
+  geom_boxplot(fill = "steelblue", color = "black", width = 0.1) +
+  labs(title = "Boxplot of Log-Transformed Total Members", y = "Log(Total Members)") +
+  theme_minimal() +
+  theme(
+    panel.grid     = element_blank(),
+    axis.title.x   = element_blank(),
+    axis.text.x    = element_blank(),
+    axis.ticks.x   = element_blank(),
+    aspect.ratio   = 2
+  )
+```
+
+
+```{r}
+# --- Descriptive statistics ---
+mean(gym_data$Total.Members)
+mean(gym_data$log_Total.Members)
+sd(gym_data$Total.Members)
+sd(gym_data$log_Total.Members)
+
+# --- Histograms with density overlays ---
+# Total Members
+ggplot(gym_data, aes(x = Total.Members)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 50, fill = "steelblue", color = "white", alpha = 0.6) +
+  geom_density(color = "red", size = 1) +
+  labs(title = "Distribution of Total Members (SD = 1411.13)",
+       x     = "Total Members", y = "Density") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(hjust = 0.5)
+  )
+
+# Log-Transformed Total Members
+ggplot(gym_data, aes(x = log_Total.Members)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 0.04, fill = "steelblue", color = "white", alpha = 0.6) +
+  geom_density(color = "red", size = 1) +
+  labs(title = "Log-Transformed Distribution of Total Members (SD = 0.37)",
+       x     = "Log(Total Members)", y = "Density") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(hjust = 0.5)
+  )
+
+```
+
+
+```{r}
+# --- Monthly membership trend visualization ---
+trend <- gym_data %>%
+  group_by(StartMonthDate) %>%
+  summarise(
+    mean_m = mean(Total.Members, na.rm = TRUE),
+    sd_m   = sd(Total.Members, na.rm = TRUE)
+  )
+
+ggplot() +
+  geom_line(
+    data  = gym_data,
+    aes(x = StartMonthDate, y = Total.Members, group = HashedGymPublicName),
+    color = "grey70", alpha = 0.05
+  ) +
+  geom_ribbon(
+    data = trend,
+    aes(x = StartMonthDate, ymin = mean_m - sd_m, ymax = mean_m + sd_m),
+    fill  = "lightblue", alpha = 0.4
+  ) +
+  geom_line(
+    data  = trend,
+    aes(x = StartMonthDate, y = mean_m),
+    color = "steelblue", size = 1
+  ) +
+  labs(
+    title = "Monthly Total Members Trend",
+    x     = "Month",
+    y     = "Total Members"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+```{r}
+# --- Spatial distribution of average monthly members ---
+uk <- ne_countries(country = "United Kingdom", scale = "medium", returnclass = "sf")
+
+gym_avg <- gym_data %>%
+  group_by(HashedGymPublicName, Longitude, Latitude) %>%
+  summarise(avg_members = mean(Total.Members, na.rm = TRUE), .groups = "drop")
+
+cities <- tribble(
+  ~name,        ~lon,      ~lat,
+  "London",     -0.1278,   51.5074,
+  "Birmingham", -1.8986,   52.4862,
+  "Manchester", -2.2426,   53.4808,
+  "Glasgow",    -4.2518,   55.8642,
+  "Edinburgh",  -3.1883,   55.9533,
+  "Cardiff",    -3.1791,   51.4816,
+  "Newcastle",  -1.6178,   54.9783,
+  "Southampton",-1.4043,   50.9097,
+  "Plymouth",   -4.1420,   50.3750
+)
+
+ggplot() +
+  geom_sf(data = uk, fill = "white", color = "grey70") +
+  geom_point(data = gym_avg,
+             aes(x = Longitude, y = Latitude, color = avg_members),
+             size = 3, alpha = 0.8) +
+  scale_color_viridis_c(name = "Avg Members", option = "C") +
+  geom_point(data = cities,
+             aes(x = lon, y = lat),
+             shape = 21, fill = "red", color = "white", size = 3, alpha = 0.6) +
+  geom_text_repel(data = cities,
+                  aes(x = lon, y = lat, label = name),
+                  size         = 2.5,
+                  fontface     = "bold",
+                  nudge_y      = 0.2,
+                  segment.size = 0.3,
+                  segment.alpha= 0.5,
+                  max.overlaps = Inf) +
+  labs(
+    title = "Spatial Total Members Feature",
+    x     = "Longitude",
+    y     = "Latitude"
+  ) +
+  coord_sf(xlim = c(-7.5, 2.5), ylim = c(49.5, 57), expand = FALSE) +
+  theme_classic() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+
+
+```{r}
+# --- Barplots of gym site characteristics ---
+ggplot(gym_data, aes(x = GymSiteType)) +
+  geom_bar(fill = "steelblue", width = 0.7) +
+  labs(
+    title = "Distribution of Gym Site Types",
+    x     = "Gym Site Type",
+    y     = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid      = element_blank(),
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.x     = element_text(angle = 45, hjust = 1)
+  )
+
+ggplot(gym_data, aes(x = GymParking)) +
+  geom_bar(fill = "darkorange", width = 0.7) +
+  labs(
+    title = "Distribution of Gym Parking Availability",
+    x     = "Gym Parking",
+    y     = "Count"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid      = element_blank(),
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.x     = element_text(angle = 45, hjust = 1)
+  )
+
+# --- Summary counts by category ---
+gym_data %>%
+  count(GymSiteType) %>%
+  arrange(desc(n)) %>%
+  print()
+
+gym_data %>%
+  count(GymParking) %>%
+  arrange(desc(n)) %>%
+  print()
+
+# --- Price sensitivity by site type ---
+gym_long <- gym_data %>%
+  select(GymSiteType, Total.Members,
+         AvgAccountPayment, AvgJoiningFee, PromoPercentage) %>%
+  pivot_longer(
+    cols      = c(AvgAccountPayment, AvgJoiningFee, PromoPercentage),
+    names_to  = "metric",
+    values_to = "x_value"
+  )
+
+ggplot(gym_long, aes(x = x_value, y = Total.Members, color = GymSiteType)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, size = 0.8) +
+  facet_wrap(~ metric, scales = "free_x",
+             labeller = as_labeller(c(
+               AvgAccountPayment = "Average Account Payment",
+               AvgJoiningFee      = "Average Joining Fee",
+               PromoPercentage    = "Promo Percentage"
+             ))) +
+  labs(
+    title = "Price Sensitivity of Membership by Gym Site Type",
+    x     = NULL,
+    y     = "Total Members",
+    color = "Gym Site Type"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid      = element_blank(),
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 14),
+    strip.text      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+
+```
+
+```{r}
+# --- Membership vs. population density across rings ---
+gym_data %>%
+  select(Total.Members, starts_with("DENS_")) %>%
+  pivot_longer(-Total.Members, names_to = "band", values_to = "density") %>%
+  ggplot(aes(x = density, y = Total.Members, color = density)) +
+    geom_point(alpha = 0.4, size = 1.5) +
+    geom_smooth(method = "lm", color = "black", se = FALSE) +
+    facet_wrap(~ band, scales = "free_x") +
+    scale_color_viridis_c(option = "A", name = "Density") +
+    scale_x_continuous(
+      labels = scales::comma,
+      breaks = scales::pretty_breaks(n = 4)
+    ) +
+    labs(
+      title = "Membership vs. Density across Distance Bands",
+      x     = "Density",
+      y     = "Total Members"
+    ) +
+    theme_classic() +
+    theme(
+      strip.text      = element_text(face = "bold"),
+      plot.title      = element_text(hjust = 0.5),
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      panel.spacing.x = unit(1, "lines")
+    )
+
+```
+
+```{r}
+# --- Membership vs. competitor count by distance bands ---
+gym_data %>%
+  select(Total.Members, X0.0.5_mile_comp, X0.5.1_mile_comp, X1.2_mile_comp) %>%
+  pivot_longer(-Total.Members, names_to = "band", values_to = "comp") %>%
+  ggplot(aes(x = comp, y = Total.Members)) +
+    geom_point(alpha = 0.4) +
+    geom_smooth(method = "lm", color = "steelblue", se = FALSE) +
+    facet_wrap(~ band, scales = "free_x") +
+    labs(
+      title = "Membership vs. Competitor Count by Band",
+      x     = "Competitor Count",
+      y     = "Total Members"
+    ) +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+# --- Membership vs. transaction count by distance bands ---
+gym_data %>%
+  select(Total.Members, starts_with("txn_count")) %>%
+  pivot_longer(-Total.Members, names_to = "band", values_to = "txn") %>%
+  ggplot(aes(x = txn, y = Total.Members)) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = "lm", color = "steelblue", se = FALSE) +
+    facet_wrap(~ band, scales = "free_x") +
+    labs(
+      title = "Membership vs. Transaction Count by Band",
+      x     = "Transaction Count",
+      y     = "Total Members"
+    ) +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+
+```{r}
+# --- Define all predictor variables by module ---
+vars_all <- c(
+  "GymParking", "GymSiteType",                        # site characteristics
+  "unis_within_0_0.5_mile", "unis_within_0.5_1_mile", "unis_within_1_2_mile",  # accessibility
+  "PromoPercentage", "AvgJoiningFee", "AvgAccountPayment",                 # operations
+  "UMAP2D_1", "UMAP2D_2",                          # user profiles
+  "BASEADL_0.5", "POP_0.5_1", "POP_1_2", "POP_2_3", "POP_3_4",           # population size
+  "DENS_0_0.5", "DENS_0.5_1", "DENS_1_2", "DENS_2_3", "DENS_3_4",        # population density
+  "DENSITY_DROP_2", "DENSITY_DROP_3", "DENSITY_DROP_4",                  # density change
+  "NEAR_POP_SHARE", "INNER_RING_SHARE", "RATIO_0_5_TO_1", "RATIO_1_TO_2", # population share
+  "X0.0.5_mile_comp", "X0.5.1_mile_comp", "X1.2_mile_comp", "CompetitorIndex",  # competition
+  "transaction_density_4", "user_density", "avg_spend_per_user", 
+  "user_repeat_rate", "distance_weighted_spend", "avg_merchant_per_user",
+  "txn_count_0_1_mi", "txn_density_0_1_mi",
+  "txn_count_1_2_mi", "txn_density_1_2_mi",
+  "txn_count_2_3_mi", "txn_density_2_3_mi",
+  "txn_count_3_4_mi", "txn_density_3_4_mi"            # market spend & transactions
+)
+
+# --- Fit a full linear regression model ---
+formula_lm <- as.formula(
+  paste("Total.Members ~", paste(vars_all, collapse = " + "))
+)
+full_linear_model <- lm(formula_lm, data = gym_data_scaled)
+
+# --- Model summary ---
+summary(full_linear_model)
+
+
+
+```
+
+```{r}
+# --- Define predictor modules to omit less relevant features ---
+vars_all_omit <- c(
+  "GymParking", "GymSiteType",                                        # site characteristics
+  "unis_within_0_0.5_mile", "unis_within_0.5_1_mile", "unis_within_1_2_mile",  # accessibility
+  "PromoPercentage", "AvgJoiningFee", "AvgAccountPayment",            # operations
+  "UMAP2D_1", "UMAP2D_2",                                             # user profiles
+  "BASEADL_0.5", "POP_0.5_1", "POP_1_2", "POP_2_3", "POP_3_4",         # population size
+  "NEAR_POP_SHARE", "INNER_RING_SHARE", "RATIO_0_5_TO_1", "RATIO_1_TO_2",       # population share
+  "X0.0.5_mile_comp", "X0.5.1_mile_comp", "X1.2_mile_comp", "CompetitorIndex",  # competition
+  "transaction_density_4", "user_density", "avg_spend_per_user",       # market spend & engagement
+  "user_repeat_rate", "distance_weighted_spend", "avg_merchant_per_user",
+  "txn_count_0_1_mi", "txn_count_1_2_mi", "txn_count_2_3_mi"           # transaction counts
+)
+
+# --- Fit linear regression excluding less relevant predictors ---
+formula_lm <- as.formula(
+  paste("Total.Members ~", paste(vars_all_omit, collapse = " + "))
+)
+full_model_omit <- lm(formula_lm, data = gym_data_scaled)
+
+# --- Summarize model results ---
+summary(full_model_omit)
+
+```
+
+
+```{r}
+# --- Random forest training & evaluation ---
+set.seed(42)
+
+# Split gyms into 80% train / 20% test by ID
+all_ids   <- unique(gym_data_scaled$HashedGymPublicName)
+train_ids <- sample(all_ids, floor(0.8 * length(all_ids)))
+test_ids  <- setdiff(all_ids, train_ids)
+
+# Create train and test datasets
+train_df <- gym_data_scaled %>%
+  filter(HashedGymPublicName %in% train_ids) %>%
+  select(Total.Members, all_of(vars_all_omit)) %>%
+  na.omit()
+test_df  <- gym_data_scaled %>%
+  filter(HashedGymPublicName %in% test_ids) %>%
+  select(Total.Members, all_of(vars_all_omit)) %>%
+  na.omit()
+
+# Fit random forest on log-members
+rf_model <- randomForest(
+  Total.Members ~ .,
+  data       = train_df,
+  ntree      = 500,
+  importance = TRUE
+)
+
+# Predict and compute RMSE/MAE on original scale
+pred <- exp(predict(rf_model, newdata = test_df))
+obs  <- exp(test_df$Total.Members)
+RMSE <- sqrt(mean((obs - pred)^2))
+MAE  <- mean(abs(obs - pred))
+cat("Test RMSE =", round(RMSE, 2), "\n")
+cat("Test MAE  =", round(MAE, 2), "\n")
+
+# Extract and display top 20 important variables
+importance_df <- rf_model$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(`%IncMSE`))
+
+top20_df <- head(importance_df, 20)
+print(top20_df)
+
+# Generate LaTeX table code for top 20 variables
+latex_code <- xtable(
+  top20_df,
+  caption = "Top 20 Variable Importances from Random Forest",
+  label   = "tab:rf_top20"
+) %>%
+  print(include.rownames = FALSE, booktabs = TRUE, print.results = FALSE)
+
+cat(latex_code)
+
+```
+
+
+```{r}
+# --- Linear model using top 20 RF-selected variables ---
+selected_vars <- importance_df$Variable[1:20]
+selected_vars <- c("GymParking", selected_vars)
+
+formula_top20 <- as.formula(
+  paste("Total.Members ~", paste(selected_vars, collapse = " + "))
+)
+
+lm_importance <- lm(formula_top20, data = gym_data_scaled)
+
+# --- Model summary & multicollinearity check ---
+summary(lm_importance)
+vif(lm_importance)
+
+```
+
+```{r}
+# --- Remove one low-importance predictor and refit linear model ---
+to_remove   <- c("transaction_density_4")
+clean_vars  <- setdiff(selected_vars, to_remove)
+formula_clean <- as.formula(paste("Total.Members ~", paste(clean_vars, collapse = " + ")))
+lm_clean    <- lm(formula_clean, data = gym_data_scaled)
+
+# --- Summarize clean model and check multicollinearity ---
+summary(lm_clean)
+vif(lm_clean)
+
+# --- Observed vs. fitted plot for clean model ---
+gym_data_scaled <- gym_data_scaled %>%
+  mutate(
+    obs    = exp(Total.Members),
+    fitted = exp(fitted(lm_clean))
+  )
+
+ggplot(gym_data_scaled, aes(x = obs, y = fitted)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(
+    title = "Observed vs. Fitted Values",
+    x     = "Observed Total.Members",
+    y     = "Fitted Total.Members"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+# --- Fit a specified linear model with interaction term ---
+formula_linear_model <- Total.Members ~ GymParking + POP_1_2 + CompetitorIndex + POP_0.5_1 + 
+    user_density + PromoPercentage + txn_count_0_1_mi + AvgAccountPayment + 
+    POP_3_4 + X1.2_mile_comp + txn_count_1_2_mi + POP_2_3 + user_repeat_rate + 
+    txn_count_2_3_mi + NEAR_POP_SHARE + GymSiteType + BASEADL_0.5 + 
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 + distance_weighted_spend + 
+    GymSiteType:AvgAccountPayment
+
+lm_step1 <- lm(formula_linear_model, data = gym_data_scaled)
+summary(lm_step1)
+
+# --- Generate observed vs. fitted plot for this model ---
+gym_data_scaled <- gym_data_scaled %>%
+  mutate(
+    obs_linear    = exp(Total.Members),
+    fitted_linear = exp(fitted(lm_step1))
+  )
+
+ggplot(gym_data_scaled, aes(x = obs_linear, y = fitted_linear)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(
+    title = "Observed vs. Fitted Values",
+    x     = "Observed Total.Members",
+    y     = "Fitted Total.Members"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+
+
+
+
+```{r}
+# --- SPDE mesh and spatial field setup ---
+coord_deg <- as.matrix(gym_data[, c("Longitude", "Latitude")])
+gym_data$coord <- coord_deg
+
+mesh_deg <- inla.mesh.2d(
+  loc      = coord_deg,
+  max.edge = c(0.5, 1),
+  cutoff   = 0.1
+)
+
+spde_deg <- inla.spde2.pcmatern(
+  mesh        = mesh_deg,
+  alpha       = 2,
+  prior.range = c(1, 0.5),
+  prior.sigma = c(1, 0.5)
+)
+
+# Visualize mesh
+plot(mesh_deg, col = "grey80", lwd = 0.5, asp = 1,
+     main = "Mesh on Original Lon/Lat (degrees)")
+points(coord_deg, col = "red", pch = 16, cex = 0.5)
+
+```
+
+
+```{r}
+
+coord_mat <- as.matrix(gym_data_scaled[, c("Longitude", "Latitude")])
+gym_data_scaled$coord <- coord_mat
+
+# --- Prepare interaction terms for payment by site type ---
+gym_data_scaled <- gym_data_scaled %>%
+  mutate(
+    isHybrid         = as.integer(GymSiteType == "Hybrid"),
+    isResidential    = as.integer(GymSiteType == "Residential"),
+    isWorkforce      = as.integer(GymSiteType == "Workforce"),
+    HybridAccPay     = isHybrid      * AvgAccountPayment,
+    ResidentialAccPay= isResidential * AvgAccountPayment,
+    WorkforceAccPay  = isWorkforce   * AvgAccountPayment
+  )
+
+# --- Define SPDE–INLA model components ---
+cmp <- ~
+  Intercept(1) +
+  GymSiteType(GymSiteType, model = "factor_contrast") +
+  GymParking(GymParking,     model = "factor_contrast") +
+  AvgAccountPayment(AvgAccountPayment) +
+  PromoPercentage(PromoPercentage) +
+  HybridAccPay(HybridAccPay) +
+  ResidentialAccPay(ResidentialAccPay) +
+  WorkforceAccPay(WorkforceAccPay) +
+  POP_1_2(POP_1_2) +
+  POP_0.5_1(POP_0.5_1) +
+  NEAR_POP_SHARE(NEAR_POP_SHARE) +
+  RATIO_0_5_TO_1(RATIO_0_5_TO_1) +
+  RATIO_1_TO_2(RATIO_1_TO_2) +
+  CompetitorIndex(CompetitorIndex) +
+  X1.2_mile_comp(X1.2_mile_comp) +
+  txn_count_0_1_mi(txn_count_0_1_mi) +
+  txn_count_1_2_mi(txn_count_1_2_mi) +
+  txn_count_2_3_mi(txn_count_2_3_mi) +
+  distance_weighted_spend(distance_weighted_spend) +
+  user_repeat_rate(user_repeat_rate) +
+  user_density(user_density) +
+  UMAP2D_1(UMAP2D_1) +
+  spatial(coord, model = spde_deg)
+
+# --- Define likelihood for Gaussian observations ---
+lik <- like(
+  formula = Total.Members ~
+    Intercept +
+    GymSiteType + GymParking +
+    AvgAccountPayment + PromoPercentage +
+    HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE +
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp +
+    txn_count_0_1_mi + txn_count_1_2_mi + txn_count_2_3_mi +
+    distance_weighted_spend + user_repeat_rate + user_density +
+    UMAP2D_1 + spatial,
+  family = "gaussian",
+  data   = gym_data_scaled
+)
+
+# --- Fit the SPDE–INLA model ---
+fit_new <- bru(
+  components = cmp,
+  lik        = lik,
+  options    = list(
+    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,
+                           config = TRUE,
+                           return.marginals.predictor = TRUE),
+    bru_verbose = TRUE
+  )
+)
+
+# --- Summarize model output ---
+summary(fit_new)
+fit_new$summary.random$GymSiteType
+fit_new$summary.random$GymParking
+fit_new$summary.hyperpar
+
+```
+
+
+
+```{r}
+# --- Posterior predictive checks for SPDE–INLA model ---
+# Extract posterior-mean linear predictor and observation noise SD
+eta_hat   <- fit_new$summary.linear.predictor$mean[1:nrow(gym_data_scaled)]
+prec_mean <- fit_new$summary.hyperpar["Precision for the Gaussian observations", "mean"]
+sigma_obs <- 1 / sqrt(prec_mean)
+
+# Simulate replicated datasets and perform PPC plots
+set.seed(42)
+S        <- 200
+Yrep     <- replicate(S, rnorm(length(eta_hat), mean = eta_hat, sd = sigma_obs))
+yrep_mat <- t(Yrep)
+y_obs    <- gym_data_scaled$Total.Members
+
+ppc_dens_overlay(y = y_obs, yrep = yrep_mat) +
+  ggtitle("Approximate PPC: Observed vs. Simulated Memberships")
+
+ppc_scatter_avg(y = y_obs, yrep = yrep_mat) +
+  ggtitle("Approximate PPC: Observed vs. Mean Simulated")
+
+```
+
+```{r}
+# --- Prepare mesh node locations for spatial effect prediction ---
+spatial_loc <- data.frame(
+  Longitude = mesh_deg$loc[,1],
+  Latitude  = mesh_deg$loc[,2]
+)
+spatial_loc$coord <- as.matrix(spatial_loc[, c("Longitude","Latitude")])
+
+# --- Predict spatial random field at mesh nodes ---
+spatial_pred <- predict(fit_new, newdata = spatial_loc, formula = ~ spatial)
+
+# --- Organize predictions into a data frame ---
+spatial_pred_df <- data.frame(
+  Longitude = spatial_loc$Longitude,
+  Latitude  = spatial_loc$Latitude,
+  mean      = spatial_pred[,"mean"],
+  lower     = spatial_pred[,"q0.025"],
+  upper     = spatial_pred[,"q0.975"]
+)
+
+# --- Plot spatial random field over UK map ---
+UK   <- map_data("world", region = "UK")
+rng  <- range(spatial_pred_df$mean, na.rm = TRUE)
+
+ggplot() +
+  gg(mesh_deg) +  # mesh structure
+  geom_polygon(data = UK, aes(long, lat, group = group),
+               fill = NA, color = "black", size = 0.3) +
+  geom_point(data = spatial_pred_df,
+             aes(x = Longitude, y = Latitude, color = mean),
+             size = 1.5, alpha = 0.9) +
+  scale_color_viridis_c(option = "A", direction = 1, limits = rng, name = "Spatial\nMean") +
+  labs(title = "Spatial Random Field over UK",
+       x     = "Longitude",
+       y     = "Latitude") +
+  coord_fixed(ratio = 1) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank(),
+        legend.title = element_text(size = 12),
+        legend.text  = element_text(size = 10))
+
+```
+
+
+
+
+```{r}
+# --- Performance metrics for SPDE–INLA model ---
+fitted_log          <- fit_new$summary.linear.predictor$mean[1:nrow(gym_data_scaled)]
+gym_data_scaled$fitted_spde <- exp(fitted_log)
+y_obs               <- exp(gym_data_scaled$Total.Members)
+
+mse_val             <- mse(y_obs, gym_data_scaled$fitted_spde)
+rmse_val            <- rmse(y_obs, gym_data_scaled$fitted_spde)
+mae_val             <- mae(y_obs, gym_data_scaled$fitted_spde)
+
+rss                 <- sum((y_obs - gym_data_scaled$fitted_spde)^2)
+tss                 <- sum((y_obs - mean(y_obs))^2)
+r2                  <- 1 - rss/tss
+
+results             <- data.frame(
+  MSE  = mse_val,
+  RMSE = rmse_val,
+  MAE  = mae_val,
+  R2   = r2
+)
+print(results)
+
+# --- Observed vs. fitted scatter plot ---
+rng <- range(c(gym_data_scaled$obs_linear, gym_data_scaled$fitted_spde), na.rm = TRUE)
+
+ggplot(gym_data_scaled, aes(x = obs_linear, y = fitted_spde)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  scale_x_continuous(limits = rng) +
+  scale_y_continuous(limits = rng) +
+  coord_equal() +
+  labs(
+    title = "Observed vs. Fitted Total Members",
+    x     = "Observed Total Members",
+    y     = "Fitted Total Members"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+```{r}
+# 0. Data Preparation and Feature Engineering
+# Create binary indicators and interaction terms, and prepare spatial coordinates and time index
+
+gym_data_scaled <- gym_data_scaled %>%
+  mutate(
+    isHybrid          = as.integer(GymSiteType == "Hybrid"),
+    isResidential     = as.integer(GymSiteType == "Residential"),
+    isWorkforce       = as.integer(GymSiteType == "Workforce"),
+    HybridAccPay      = isHybrid      * AvgAccountPayment,
+    ResidentialAccPay = isResidential * AvgAccountPayment,
+    WorkforceAccPay   = isWorkforce   * AvgAccountPayment,
+    month_id          = Month_Index   # integer-coded month index
+  )
+# Assemble spatial coordinates matrix
+gym_data_scaled$coord <- as.matrix(gym_data_scaled[, c("Longitude", "Latitude")])
+
+
+# 1. Define Common Fixed-Effects Components
+# Specify shared covariates for Bayesian models
+common_cmp <- ~
+  Intercept(1) +
+  GymSiteType(GymSiteType, model = "factor_contrast") +
+  GymParking(GymParking, model = "factor_contrast") +
+  AvgAccountPayment(AvgAccountPayment, model = "linear") +
+  PromoPercentage(PromoPercentage, model = "linear") +
+  HybridAccPay(HybridAccPay, model = "linear") +
+  ResidentialAccPay(ResidentialAccPay, model = "linear") +
+  WorkforceAccPay(WorkforceAccPay, model = "linear") +
+  POP_1_2(POP_1_2, model = "linear") +
+  POP_0.5_1(POP_0.5_1, model = "linear") +
+  NEAR_POP_SHARE(NEAR_POP_SHARE, model = "linear") +
+  RATIO_0_5_TO_1(RATIO_0_5_TO_1, model = "linear") +
+  RATIO_1_TO_2(RATIO_1_TO_2, model = "linear") +
+  CompetitorIndex(CompetitorIndex, model = "linear") +
+  X1.2_mile_comp(X1.2_mile_comp, model = "linear") +
+  txn_count_0_1_mi(txn_count_0_1_mi, model = "linear") +
+  txn_count_1_2_mi(txn_count_1_2_mi, model = "linear") +
+  txn_count_2_3_mi(txn_count_2_3_mi, model = "linear") +
+  distance_weighted_spend(distance_weighted_spend, model = "linear") +
+  user_repeat_rate(user_repeat_rate, model = "linear") +
+  user_density(user_density, model = "linear") +
+  UMAP2D_1(UMAP2D_1, model = "linear")
+
+
+# 2a. Model 1: Baseline (No Spatial or Temporal Effects)
+# Define likelihood and fit baseline Gaussian model
+lik1 <- like(
+  formula = Total.Members ~
+    Intercept + GymSiteType + GymParking +
+    AvgAccountPayment + PromoPercentage +
+    HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE +
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp +
+    txn_count_0_1_mi + txn_count_1_2_mi + txn_count_2_3_mi +
+    distance_weighted_spend +
+    user_repeat_rate + user_density +
+    UMAP2D_1,
+  family = "gaussian",
+  data   = gym_data_scaled
+)
+fit1 <- bru(
+  components = common_cmp,
+  lik        = lik1,
+  options    = list(control.compute = list(dic = TRUE), bru_verbose = FALSE)
+)
+
+
+# 2b. Model 2: Add Spatial (SPDE) Effect
+# Extend components to include a spatial random field
+cmp2 <- ~Intercept(1) +
+  GymSiteType(GymSiteType, model = "factor_contrast") +
+  GymParking(GymParking, model = "factor_contrast") +
+  AvgAccountPayment(AvgAccountPayment, model = "linear") +
+  PromoPercentage(PromoPercentage, model = "linear") +
+  HybridAccPay(HybridAccPay, model = "linear") +
+  ResidentialAccPay(ResidentialAccPay, model = "linear") +
+  WorkforceAccPay(WorkforceAccPay, model = "linear") +
+  POP_1_2(POP_1_2, model = "linear") +
+  POP_0.5_1(POP_0.5_1, model = "linear") +
+  NEAR_POP_SHARE(NEAR_POP_SHARE, model = "linear") +
+  RATIO_0_5_TO_1(RATIO_0_5_TO_1, model = "linear") +
+  RATIO_1_TO_2(RATIO_1_TO_2, model = "linear") +
+  CompetitorIndex(CompetitorIndex, model = "linear") +
+  X1.2_mile_comp(X1.2_mile_comp, model = "linear") +
+  txn_count_0_1_mi(txn_count_0_1_mi, model = "linear") +
+  txn_count_1_2_mi(txn_count_1_2_mi, model = "linear") +
+  txn_count_2_3_mi(txn_count_2_3_mi, model = "linear") +
+  distance_weighted_spend(distance_weighted_spend, model = "linear") +
+  user_repeat_rate(user_repeat_rate, model = "linear") +
+  user_density(user_density, model = "linear") +
+  UMAP2D_1(UMAP2D_1, model = "linear") +
+  spatial(coord, model = spde_deg)
+
+lik2 <- like(
+  formula = Total.Members ~
+    Intercept + GymSiteType + GymParking +
+    AvgAccountPayment + PromoPercentage +
+    HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE +
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp +
+    txn_count_0_1_mi + txn_count_1_2_mi + txn_count_2_3_mi +
+    distance_weighted_spend +
+    user_repeat_rate + user_density +
+    UMAP2D_1 + spatial,
+  family = "gaussian",
+  data   = gym_data_scaled
+)
+fit2 <- bru(
+  components = cmp2,
+  lik        = lik2,
+  options    = list(control.compute = list(dic = TRUE), bru_verbose = FALSE)
+)
+
+
+# 2c. Model 3: Add Temporal (1D SPDE) Effect
+# Build a 1D time mesh and define temporal SPDE
+# Prepare time index mesh
+t_seq    <- sort(unique(gym_data_scaled$month_id))
+time_mesh <- inla.mesh.1d(loc = t_seq, interval = range(t_seq), degree = 2)
+# Define Matérn SPDE for time
+spde_time <- inla.spde2.pcmatern(
+  mesh       = time_mesh,
+  prior.range  = c(3, 0.5),  # probability(range < 3 months) = 0.5
+  prior.sigma  = c(1, 0.01)   # probability(sigma > 1) = 0.01
+)
+
+# Extend components with temporal field
+cmp_3 <- ~ Intercept(1) +
+  GymSiteType(GymSiteType, model = "factor_contrast") +
+  GymParking(GymParking, model = "factor_contrast") +
+  AvgAccountPayment(AvgAccountPayment, model = "linear") +
+  PromoPercentage(PromoPercentage, model = "linear") +
+  HybridAccPay(HybridAccPay, model = "linear") +
+  ResidentialAccPay(ResidentialAccPay, model = "linear") +
+  WorkforceAccPay(WorkforceAccPay, model = "linear") +
+  POP_1_2(POP_1_2, model = "linear") +
+  POP_0.5_1(POP_0.5_1, model = "linear") +
+  NEAR_POP_SHARE(NEAR_POP_SHARE, model = "linear") +
+  RATIO_0_5_TO_1(RATIO_0_5_TO_1, model = "linear") +
+  RATIO_1_TO_2(RATIO_1_TO_2, model = "linear") +
+  CompetitorIndex(CompetitorIndex, model = "linear") +
+  X1.2_mile_comp(X1.2_mile_comp, model = "linear") +
+  txn_count_0_1_mi(txn_count_0_1_mi, model = "linear") +
+  txn_count_1_2_mi(txn_count_1_2_mi, model = "linear") +
+  txn_count_2_3_mi(txn_count_2_3_mi, model = "linear") +
+  distance_weighted_spend(distance_weighted_spend, model = "linear") +
+  user_repeat_rate(user_repeat_rate, model = "linear") +
+  user_density(user_density, model = "linear") +
+  UMAP2D_1(UMAP2D_1, model = "linear") +
+  spatial(coord, model = spde_deg) +
+  time_spde(month_id, model = spde_time)
+
+lik_3 <- like(
+  formula = Total.Members ~
+    Intercept + GymSiteType + GymParking +
+    AvgAccountPayment + PromoPercentage +
+    HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE +
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp +
+    txn_count_0_1_mi + txn_count_1_2_mi + txn_count_2_3_mi +
+    distance_weighted_spend +
+    user_repeat_rate + user_density +
+    UMAP2D_1 + spatial + time_spde,
+  family = "gaussian",
+  data   = gym_data_scaled
+)
+fit3 <- bru(
+  components = cmp_3,
+  lik        = lik_3,
+  options    = list(control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE), bru_verbose = TRUE)
+)
+
+
+# 3. Model Comparison Metrics
+# Extract DIC for each model and compute predictive performance on original scale
+
+dic1  <- fit1$dic$dic
+dic2  <- fit2$dic$dic
+dic3  <- fit3$dic$dic
+
+# Back-transform predictions and calculate RMSE and R²
+
+y_obs <- exp(gym_data_scaled$Total.Members)
+log_pred1 <- fit1$summary.linear.predictor$mean[1:nrow(gym_data_scaled)]
+log_pred2 <- fit2$summary.linear.predictor$mean[1:nrow(gym_data_scaled)]
+log_pred3 <- fit3$summary.linear.predictor$mean[1:nrow(gym_data_scaled)]
+
+pred1 <- exp(log_pred1)
+pred2 <- exp(log_pred2)
+pred3 <- exp(log_pred3)
+
+rmse1 <- sqrt(mean((y_obs - pred1)^2))
+rmse2 <- sqrt(mean((y_obs - pred2)^2))
+rmse3 <- sqrt(mean((y_obs - pred3)^2))
+
+r2_1 <- cor(y_obs, pred1)^2
+r2_2 <- cor(y_obs, pred2)^2
+r2_3 <- cor(y_obs, pred3)^2
+
+# Summarize results in a table
+results <- data.frame(
+  Model = c("Baseline", "With spatial", "With spatial and temporal"),
+  DIC   = c(dic1, dic2, dic3),
+  RMSE  = c(rmse1, rmse2, rmse3),
+  R2    = c(r2_1, r2_2, r2_3)
+)
+print(results)
+
+```
+
+
+```{r}
+# --- Split data into 70% train / 30% test by rows ---
+set.seed(42)  
+n          <- nrow(gym_data_scaled)
+train_size <- floor(0.7 * n)
+shuffled_idx <- sample(seq_len(n))
+train_idx  <- shuffled_idx[1:train_size]
+test_idx   <- shuffled_idx[(train_size + 1):n]
+train_df   <- gym_data_scaled[train_idx, ]
+test_df    <- gym_data_scaled[test_idx, ]
+
+# --- Verify split sizes ---
+cat("Training rows:", nrow(train_df), "\n")
+cat("Testing rows: ", nrow(test_df), "\n")
+
+```
+
+
+
+```{r}
+# --- Define Bayesian multilevel model with spatial GP term ---
+brm_formula_noint <- bf(
+  Total.Members ~
+    GymSiteType +
+    GymParking +
+    AvgAccountPayment +
+    PromoPercentage +
+    POP_1_2 +
+    POP_0.5_1 +
+    NEAR_POP_SHARE +
+    RATIO_0_5_TO_1 +
+    RATIO_1_TO_2 +
+    CompetitorIndex +
+    X1.2_mile_comp +
+    txn_count_0_1_mi +
+    txn_count_1_2_mi +
+    txn_count_2_3_mi +
+    distance_weighted_spend +
+    user_repeat_rate +
+    user_density +
+    UMAP2D_1 +
+    gp(Longitude, Latitude, k = 30)
+)
+
+# --- Specify priors for fixed effects, intercept, and GP sd ---
+priors <- c(
+  prior(normal(0, 10), class = "b"),
+  prior(normal(0, 10), class = "Intercept"),
+  prior(exponential(1), class = "sdgp")
+)
+
+# --- Fit BRMS model on training data ---
+fit_brms_train <- brm(
+  formula = brm_formula_noint,
+  data    = train_df,
+  family  = gaussian(),
+  prior   = priors,
+  cores   = 4,
+  chains  = 2,
+  iter    = 2000,
+  control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+
+# --- Posterior prediction and performance on test data ---
+lp_test   <- posterior_linpred(fit_brms_train, newdata = test_df)
+pp_test   <- exp(lp_test)                   # back-transform
+y_pred    <- colMeans(pp_test)
+y_true    <- exp(test_df$Total.Members)
+
+rmse_brms <- rmse(y_true, y_pred)
+mae_brms  <- mae(y_true, y_pred)
+r2_brms   <- cor(y_true, y_pred)^2
+
+cat(sprintf("BRMS Test RMSE = %.2f\n", rmse_brms))
+cat(sprintf("BRMS Test MAE  = %.2f\n", mae_brms))
+cat(sprintf("BRMS Test R²   = %.3f\n", r2_brms))
+
+```
+
+
+
+```{r}
+# --- Fit linear model on training data ---
+lm_comparison <- lm(
+  Total.Members ~ GymParking + POP_1_2 + CompetitorIndex + POP_0.5_1 + 
+    user_density + PromoPercentage + txn_count_0_1_mi + AvgAccountPayment + 
+    POP_3_4 + X1.2_mile_comp + txn_count_1_2_mi + POP_2_3 + user_repeat_rate + 
+    txn_count_2_3_mi + NEAR_POP_SHARE + GymSiteType + BASEADL_0.5 + 
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 + distance_weighted_spend + 
+    GymSiteType:AvgAccountPayment,
+  data = train_df
+)
+
+# --- Predict and evaluate on test data ---
+log_pred_test <- predict(lm_comparison, newdata = test_df)
+y_pred        <- exp(log_pred_test)             # back-transform to original scale
+y_true        <- exp(test_df$Total.Members)
+
+rmse_linear <- rmse(y_true, y_pred)
+mae_linear  <- mae(y_true, y_pred)
+r2_linear   <- cor(y_true, y_pred)^2
+
+cat(sprintf("Linear Model Test RMSE = %.2f\n", rmse_linear))
+cat(sprintf("Linear Model Test MAE  = %.2f\n", mae_linear))
+cat(sprintf("Linear Model Test R²   = %.3f\n", r2_linear))
+
+```
+
+
+```{r}
+# --- Fit SPDE–INLA model on training data ---
+fit_train <- bru(
+  components = cmp,
+  lik        = like(
+    formula = Total.Members ~
+      Intercept + GymSiteType + GymParking + AvgAccountPayment + 
+      PromoPercentage + HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+      POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE + RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+      CompetitorIndex + X1.2_mile_comp + txn_count_0_1_mi + txn_count_1_2_mi +
+      txn_count_2_3_mi + distance_weighted_spend +
+      user_repeat_rate + user_density + UMAP2D_1 + spatial,
+    family = "gaussian",
+    data   = train_df
+  ),
+  options = list(
+    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE,
+                           return.marginals.predictor = TRUE),
+    bru_verbose = FALSE
+  )
+)
+
+# --- Predict on test data using fitted model ---
+pred_test_df <- predict(
+  fit_train,
+  newdata = test_df,
+  formula = ~
+    Intercept + GymSiteType + GymParking + AvgAccountPayment + 
+    PromoPercentage + HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE + RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp + txn_count_0_1_mi + txn_count_1_2_mi +
+    txn_count_2_3_mi + distance_weighted_spend +
+    user_repeat_rate + user_density + UMAP2D_1 + spatial
+)
+
+# --- Compute performance metrics on original scale ---
+eta_hat_test <- pred_test_df$mean
+y_pred       <- exp(eta_hat_test)
+y_true       <- exp(test_df$Total.Members)
+
+rmse_spade <- rmse(y_true, y_pred)
+mae_spade  <- mae(y_true, y_pred)
+r2_spade   <- cor(y_true, y_pred)^2
+
+cat(sprintf("Test RMSE = %.2f\n", rmse_spade))
+cat(sprintf("Test MAE  = %.2f\n", mae_spade))
+cat(sprintf("Test R²   = %.3f\n", r2_spade))
+
+```
+
+
+
+```{r}
+# --- Fit mixed-effects model on training data with gym-specific random intercept ---
+mixed_formula <- Total.Members ~ GymParking + POP_1_2 + CompetitorIndex + POP_0.5_1 +
+  user_density + PromoPercentage + txn_count_0_1_mi + AvgAccountPayment +
+  POP_3_4 + X1.2_mile_comp + txn_count_1_2_mi + POP_2_3 + user_repeat_rate +
+  txn_count_2_3_mi + NEAR_POP_SHARE + GymSiteType + BASEADL_0.5 +
+  RATIO_0_5_TO_1 + RATIO_1_TO_2 + distance_weighted_spend +
+  GymSiteType:AvgAccountPayment +
+  (1 | HashedGymPublicName)
+
+mixed_model <- lmer(formula = mixed_formula, data = train_df, REML = FALSE)
+
+# --- Predict and evaluate mixed-effects model on test data ---
+pred_test <- predict(mixed_model, newdata = test_df, allow.new.levels = TRUE)
+y_true    <- exp(test_df$Total.Members)
+y_pred    <- exp(pred_test)
+
+rmse_mixed <- rmse(y_true, y_pred)
+mae_mixed  <- mae(y_true, y_pred)
+cov_yp     <- cov(y_true, y_pred)
+r2_mixed   <- (cov_yp / (sd(y_true) * sd(y_pred)))^2
+
+cat(sprintf("Mixed Model Test RMSE = %.2f\n", rmse_mixed))
+cat(sprintf("Mixed Model Test MAE  = %.2f\n", mae_mixed))
+cat(sprintf("Mixed Model Test R²   = %.3f\n", r2_mixed))
+
+```
+
+
+
+```{r}
+# --- Prepare rounded metrics for table ---
+rmse_spade  <- round(rmse_spade, 2)
+mae_spade   <- round(mae_spade, 2)
+r2_spade    <- round(r2_spade, 3)
+
+rmse_linear <- round(rmse_linear, 2)
+mae_linear  <- round(mae_linear, 2)
+r2_linear   <- round(r2_linear, 3)
+
+rmse_mixed  <- round(rmse_mixed, 2)
+mae_mixed   <- round(mae_mixed, 2)
+r2_mixed    <- round(r2_mixed, 3)
+
+rmse_brms   <- round(rmse_brms, 2)
+mae_brms    <- round(mae_brms, 2)
+r2_brms     <- round(r2_brms, 3)
+
+# --- Compile comparison results into a data frame ---
+comparison_results <- data.frame(
+  Model = c("INLA Spatial", "Linear LM", "Mixed LMM", "BRMS GP"),
+  RMSE  = c(rmse_spade, rmse_linear, rmse_mixed, rmse_brms),
+  MAE   = c(mae_spade, mae_linear, mae_mixed, mae_brms),
+  R2    = c(r2_spade, r2_linear, r2_mixed, r2_brms)
+)
+
+# --- Generate LaTeX table code ---
+print(
+  xtable(
+    comparison_results,
+    caption = "Model comparison across benchmarks",
+    label   = "tab:model_summary",
+    digits  = c(0, 2, 2, 2, 3)
+  ),
+  include.rownames = FALSE,
+  booktabs = TRUE
+)
+
+```
+
+```{r}
+# --- Predict posterior mean membership at observed locations ---
+pred_df <- predict(
+  fit_new,
+  newdata = gym_data_scaled,
+  formula = ~ Intercept + GymSiteType + GymParking + AvgAccountPayment + 
+    PromoPercentage + HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE + RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp + txn_count_0_1_mi + txn_count_1_2_mi +
+    txn_count_2_3_mi + distance_weighted_spend +
+    user_repeat_rate + user_density + UMAP2D_1 + spatial
+)
+pred_vec <- pred_df$mean
+
+# --- Prepare visualization dataframe with coordinates and predicted counts ---
+vis_df <- gym_data_scaled %>%
+  select(Longitude, Latitude) %>%
+  mutate(mean_count = exp(pred_vec))
+
+# --- Get UK map boundary data ---
+uk_border <- map_data("world", region = "UK")
+
+# --- Plot spatial distribution of predicted membership ---
+ggplot() +
+  geom_polygon(
+    data = uk_border,
+    aes(x = long, y = lat, group = group),
+    fill  = NA, color = "black", size = 0.3
+  ) +
+  geom_point(
+    data = vis_df,
+    aes(x = Longitude, y = Latitude, color = mean_count),
+    size  = 1.8, alpha = 0.8
+  ) +
+  scale_color_viridis_c(name = "Predicted\nMembers", option = "C") +
+  coord_quickmap() +
+  labs(
+    title = "Spatial Distribution of Predicted Gym Membership",
+    x     = "Longitude",
+    y     = "Latitude"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+
+```{r}
+# --- Define function to reverse-geocode coordinates to postcodes ---
+reverse_geocode_single <- function(lon, lat) {
+  res <- GET(
+    url   = "https://api.postcodes.io/postcodes",
+    query = list(lon = lon, lat = lat)
+  )
+  d <- content(res, "parsed", simplifyVector = TRUE)
+  if (!is.null(d$result) && nrow(d$result) >= 1) {
+    return(d$result$postcode[1])
+  } else {
+    return(NA_character_)
+  }
+}
+
+# --- Extract unique gym locations for geocoding ---
+gyms_unique <- gym_data_scaled %>%
+  distinct(HashedGymPublicName, Longitude, Latitude)
+
+# --- Apply reverse-geocoding to each gym location ---
+gyms_pc <- gyms_unique %>%
+  mutate(
+    postcode = map2_chr(Longitude, Latitude, reverse_geocode_single)
+  )
+
+# --- Merge postcodes back into the full dataset ---
+gym_data_with_pc <- gym_data_scaled %>%
+  left_join(
+    gyms_pc %>% select(HashedGymPublicName, postcode),
+    by = "HashedGymPublicName"
+  )
+```
+
+
+```{r}
+library(dplyr)
+library(purrr)
+
+
+# Define regex for each city’s postcode prefixes
+city_patterns <- list(
+  London    = "^(E|EC|N|NW|SE|SW|W|WC)",
+  Manchester= "^M",
+  Birmingham= "^B",
+  Edinburgh = "^EH",
+  Glasgow   = "^G"
+)
+
+# Assign each gym to one city (or “Other”)
+gym_data_city <- gym_data_with_pc %>%
+  mutate(
+    City = map_chr(postcode, function(pc) {
+      city <- keep(city_patterns, ~ grepl(.x, pc))
+      if (length(city)) names(city)[1] else "Other"
+    })
+  )
+
+# Base‐ and +£1 predictions (on log‐scale)
+pred_base <- predict(fit_new, newdata = gym_data_city, formula = ~ Intercept + GymSiteType + GymParking + AvgAccountPayment + 
+      PromoPercentage + HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+      POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE + RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+      CompetitorIndex + X1.2_mile_comp + txn_count_0_1_mi + txn_count_1_2_mi +
+      txn_count_2_3_mi + distance_weighted_spend +
+      user_repeat_rate + user_density + UMAP2D_1 + spatial)$mean
+
+sd_price <- sd(gym_data$AvgAccountPayment, na.rm = TRUE)
+
+pred_up1  <- predict(
+  fit_new,
+  newdata = gym_data_city %>% mutate(AvgAccountPayment = AvgAccountPayment + 1/sd_price),
+  formula = ~ Intercept + GymSiteType + GymParking + AvgAccountPayment + 
+      PromoPercentage + HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+      POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE + RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+      CompetitorIndex + X1.2_mile_comp + txn_count_0_1_mi + txn_count_1_2_mi +
+      txn_count_2_3_mi + distance_weighted_spend +
+      user_repeat_rate + user_density + UMAP2D_1 + spatial
+)$mean
+
+# Back‐transform and Δ₁
+gym_data_city <- gym_data_city %>%
+  mutate(
+    mu_base = exp(pred_base),
+    mu_up1  = exp(pred_up1),
+    delta1  = (mu_up1 - mu_base)/mu_base *100
+  )
+
+
+
+summary_by_city <- gym_data_city %>%
+  group_by(City) %>%
+  summarize(
+    mean_delta   = mean(delta1, na.rm = TRUE),
+    median_delta = median(delta1, na.rm = TRUE),
+    sd_delta     = sd(delta1, na.rm = TRUE),
+    n            = n()
+  )
+
+print(summary_by_city)
+
+```
+
+```{r}
+# Calculate percentage change in membership per £1 price increase
+gym_data_city <- gym_data_city %>%
+  mutate(pct_change = delta1 / mu_base * 100)
+
+# Summarise price elasticity by city
+summary_pct <- gym_data_city %>%
+  group_by(City) %>%
+  summarize(
+    mean_pct = mean(pct_change, na.rm = TRUE),
+    sd_pct   = sd(pct_change,   na.rm = TRUE)
+  )
+
+# Plot average percentage change with error bars
+ggplot(summary_pct, aes(x = City, y = mean_pct, fill = City)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+                width = 0.2) +
+  labs(
+    x        = NULL,
+    y        = "Avg % Change in Membership per £1 ↑",
+    title    = "Price Elasticity by City",
+    subtitle = "Mean ± 1 SD"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+```{r}
+# --- Summarize price elasticity by gym site type ---
+summary_by_type <- gym_data_city %>%
+  group_by(GymSiteType) %>%
+  summarize(
+    mean_pct = mean(pct_change, na.rm = TRUE),
+    sd_pct   = sd(pct_change,   na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# --- Plot mean percentage change with ±1 SD error bars ---
+ggplot(summary_by_type, aes(x = GymSiteType, y = mean_pct, fill = GymSiteType)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = mean_pct - sd_pct, ymax = mean_pct + sd_pct),
+                width = 0.2) +
+  labs(
+    x        = "Gym Type",
+    y        = "Avg % Change in Membership per £1 ↑",
+    title    = "Price Elasticity by Gym Site Type",
+    subtitle = "Mean ± 1 SD"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(size = 11))
+```
+
+
+
+```{r}
+# --- Add quadratic price term ---
+gym_data_scaled <- gym_data_scaled %>%
+  mutate(AvgAccountPayment2 = AvgAccountPayment^2)
+
+# --- Define SPDE–INLA model components including quadratic price ---
+cmp_price <- ~
+  Intercept(1) +
+  GymSiteType(GymSiteType, model="factor_contrast") +
+  GymParking(GymParking,     model="factor_contrast") +
+  AvgAccountPayment(AvgAccountPayment) +
+  AvgAccountPayment2(AvgAccountPayment2) +
+  PromoPercentage(PromoPercentage) +
+  HybridAccPay(HybridAccPay) +
+  ResidentialAccPay(ResidentialAccPay) +
+  WorkforceAccPay(WorkforceAccPay) +
+  POP_1_2(POP_1_2) +
+  POP_0.5_1(POP_0.5_1) +
+  NEAR_POP_SHARE(NEAR_POP_SHARE) +
+  RATIO_0_5_TO_1(RATIO_0_5_TO_1) +
+  RATIO_1_TO_2(RATIO_1_TO_2) +
+  CompetitorIndex(CompetitorIndex) +
+  X1.2_mile_comp(X1.2_mile_comp) +
+  txn_count_0_1_mi(txn_count_0_1_mi) +
+  txn_count_1_2_mi(txn_count_1_2_mi) +
+  txn_count_2_3_mi(txn_count_2_3_mi) +
+  distance_weighted_spend(distance_weighted_spend) +
+  user_repeat_rate(user_repeat_rate) +
+  user_density(user_density) +
+  UMAP2D_1(UMAP2D_1) +
+  spatial(coord, model=spde_deg)
+
+# --- Specify likelihood and fit the model ---
+lik_price <- like(
+  formula = Total.Members ~
+    Intercept + GymSiteType + GymParking +
+    AvgAccountPayment + AvgAccountPayment2 + PromoPercentage +
+    HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+    POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE +
+    RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+    CompetitorIndex + X1.2_mile_comp +
+    txn_count_0_1_mi + txn_count_1_2_mi + txn_count_2_3_mi +
+    distance_weighted_spend + user_repeat_rate + user_density +
+    UMAP2D_1 + spatial,
+  family = "gaussian",
+  data   = gym_data_scaled
+)
+
+fit_price <- bru(
+  components = cmp_price,
+  lik        = lik_price,
+  options    = list(
+    control.compute = list(dic=TRUE, waic=TRUE, cpo=TRUE,
+                           config=TRUE, 
+                           return.marginals.predictor=TRUE),
+    bru_verbose = TRUE
+  )
+)
+
+# --- Compute revenue under fitted model ---
+gym_data_rev <- gym_data_scaled %>%
+  mutate(
+    eta     = predict(fit_price, newdata = gym_data_scaled,
+                      formula = ~ Intercept + GymSiteType + GymParking +
+                          AvgAccountPayment + AvgAccountPayment2 + PromoPercentage +
+                          HybridAccPay + ResidentialAccPay + WorkforceAccPay +
+                          POP_1_2 + POP_0.5_1 + NEAR_POP_SHARE +
+                          RATIO_0_5_TO_1 + RATIO_1_TO_2 +
+                          CompetitorIndex + X1.2_mile_comp +
+                          txn_count_0_1_mi + txn_count_1_2_mi +
+                          txn_count_2_3_mi + distance_weighted_spend +
+                          user_repeat_rate + user_density +
+                          UMAP2D_1 + spatial)$mean,
+    members = exp(eta),
+    Price   = gym_data$AvgAccountPayment,
+    Revenue = members * Price
+  )
+
+# --- Identify month with maximum predicted revenue per gym ---
+best_month_per_gym <- gym_data_rev %>%
+  group_by(HashedGymPublicName) %>%
+  slice_max(order_by = Revenue, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(HashedGymPublicName, Month_Index, Price, members, Revenue)
+
+
+```
+
+
+```{r}
+# --- Plot distribution of optimal prices with fitted normal curve ---
+mu    <- mean(best_month_per_gym$Price, na.rm = TRUE)
+sigma <- sd(best_month_per_gym$Price, na.rm = TRUE)
+
+ggplot(best_month_per_gym, aes(x = Price)) +
+  geom_histogram(aes(y = ..density..), binwidth = 5, fill = "steelblue", color = "white") +
+  stat_function(fun = dnorm, args = list(mean = mu, sd = sigma), color = "darkred", size = 1) +
+  labs(
+    x     = "Optimal Monthly Price (£)",
+    y     = "Density",
+    title = "Distribution of Revenue-Maximizing Prices"
+  ) +
+  theme_minimal()
+
+# --- Plot relationship between optimal price and predicted max revenue ---
+ggplot(best_month_per_gym, aes(x = Price, y = Revenue)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(
+    x     = "Optimal Monthly Price (£)",
+    y     = "Max Predicted Revenue (£)",
+    title = "Optimal Price vs. Maximum Predicted Revenue"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# --- Prepare first-month data and perform PCA ---
+df_first_month <- gym_data_scaled %>%
+  filter(Month_Index == 1)
+X <- df_first_month[, 5:47]
+pca_res <- prcomp(X, center = FALSE, scale. = FALSE)
+
+# --- Scree plot and cumulative variance ---
+eigvals <- pca_res$sdev^2
+plot(eigvals, type = "b", pch = 19,
+     xlab = "Principal Component",
+     ylab = "Eigenvalue",
+     main = "PCA Scree Plot")
+abline(h = 1, col = "red", lty = 2)
+prop_var <- eigvals / sum(eigvals)
+cum_var  <- cumsum(prop_var)
+plot(cum_var, type = "b", pch = 19,
+     xlab = "Number of Components",
+     ylab = "Cumulative Proportion of Variance",
+     main = "Cumulative Variance Explained")
+abline(h = 0.8, col = "blue", lty = 2)
+
+# --- K-means clustering on selected principal components ---
+pc_scores <- pca_res$x[, 1:5]
+wss <- sapply(1:10, function(K) {
+  kmeans(pc_scores, centers = K, nstart = 20)$tot.withinss
+})
+plot(1:10, wss, type = "b", pch = 19,
+     xlab = "Number of Clusters (K)",
+     ylab = "Total Within-Cluster SS",
+     main = "Elbow Method for k-means")
+set.seed(12)
+km_res <- kmeans(pc_scores, centers = 2, nstart = 50)
+df_first_month$cluster <- factor(km_res$cluster)
+
+# --- Visualize clusters in PCA space and on UK map ---
+df_plot <- as.data.frame(pc_scores[, 1:2])
+df_plot$cluster <- df_first_month$cluster
+ggplot(df_plot, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(
+    title = "k-means Clustering on PCA Scores (PC1 vs PC2)"
+  ) +
+  theme_minimal()
+
+uk_border <- map_data("world", region = "UK")
+ggplot() +
+  geom_polygon(
+    data = uk_border,
+    aes(x = long, y = lat, group = group),
+    fill  = NA, color = "black", size = 0.3
+  ) +
+  geom_point(
+    data = df_first_month,
+    aes(x = Longitude, y = Latitude, color = cluster),
+    size  = 2, alpha = 0.8
+  ) +
+  scale_color_manual(
+    values = c("1" = "red", "2" = "yellow"),
+    name   = "Cluster"
+  ) +
+  coord_quickmap() +
+  labs(
+    title = "Spatial Distribution of k-means Clusters (First Month)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+
+```
+
+
+
+
+
+
+
+
+
+
